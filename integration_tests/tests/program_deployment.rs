@@ -1,0 +1,92 @@
+#![expect(
+    clippy::tests_outside_test_module,
+    reason = "We don't care about these in tests"
+)]
+
+use std::{path::PathBuf, time::Duration};
+
+use anyhow::Result;
+use common::transaction::LeeTransaction;
+use integration_tests::{
+    LEE_PROGRAM_FOR_TEST_DATA_CHANGER, TIME_TO_WAIT_FOR_BLOCK_SECONDS, TestContext,
+};
+use lee::program::Program;
+use log::info;
+use sequencer_service_rpc::RpcClient as _;
+use tokio::test;
+use wallet::cli::{
+    Command, SubcommandReturnValue,
+    account::{AccountSubcommand, NewSubcommand},
+};
+
+#[test]
+async fn deploy_and_execute_program() -> Result<()> {
+    let mut ctx = TestContext::new().await?;
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let binary_filepath: PathBuf = PathBuf::from(manifest_dir)
+        .join("../artifacts/test_program_methods")
+        .join(LEE_PROGRAM_FOR_TEST_DATA_CHANGER);
+
+    let command = Command::DeployProgram {
+        binary_filepath: binary_filepath.clone(),
+    };
+
+    wallet::cli::execute_subcommand(ctx.wallet_mut(), command).await?;
+
+    info!("Waiting for next block creation");
+    tokio::time::sleep(Duration::from_secs(TIME_TO_WAIT_FOR_BLOCK_SECONDS)).await;
+
+    // The program is the data changer and takes one account as input.
+    // We pass an uninitialized account and we expect after execution to be owned by the data
+    // changer program (LEE account claiming mechanism) with data equal to [0] (due to program
+    // logic)
+    let bytecode = std::fs::read(binary_filepath)?;
+    let data_changer = Program::new(bytecode)?;
+
+    let SubcommandReturnValue::RegisterAccount { account_id } = wallet::cli::execute_subcommand(
+        ctx.wallet_mut(),
+        Command::Account(AccountSubcommand::New(NewSubcommand::Public {
+            cci: None,
+            label: None,
+        })),
+    )
+    .await?
+    else {
+        panic!("Expected RegisterAccount return value");
+    };
+
+    let nonces = ctx.wallet().get_accounts_nonces(vec![account_id]).await?;
+    let private_key = ctx
+        .wallet()
+        .get_account_public_signing_key(account_id)
+        .unwrap();
+    let message = lee::public_transaction::Message::try_new(
+        data_changer.id(),
+        vec![account_id],
+        nonces,
+        vec![0],
+    )?;
+    let witness_set = lee::public_transaction::WitnessSet::for_message(&message, &[private_key]);
+    let transaction = lee::PublicTransaction::new(message, witness_set);
+    let _response = ctx
+        .sequencer_client()
+        .send_transaction(LeeTransaction::Public(transaction))
+        .await?;
+
+    info!("Waiting for next block creation");
+    // Waiting for long time as it may take some time for such a big transaction to be included in a
+    // block
+    tokio::time::sleep(Duration::from_secs(2 * TIME_TO_WAIT_FOR_BLOCK_SECONDS)).await;
+
+    let post_state_account = ctx.sequencer_client().get_account(account_id).await?;
+
+    assert_eq!(post_state_account.program_owner, data_changer.id());
+    assert_eq!(post_state_account.balance, 0);
+    assert_eq!(post_state_account.data.as_ref(), &[0]);
+    assert_eq!(post_state_account.nonce.0, 1);
+
+    info!("Successfully deployed and executed program");
+
+    Ok(())
+}

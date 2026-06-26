@@ -1,0 +1,123 @@
+on:
+  push:
+    branches:
+      - main
+      - lp0002-demo-rc5
+    paths:
+      - "programs/msig/**"
+      - "test_program_methods/guest/src/bin/msig.rs"
+      - "examples/program_deployment/**"
+      - "lee/state_machine/src/state.rs"
+      - "lee/state_machine/src/privacy_preserving_transaction/circuit.rs"
+      - "scripts/lp0002-demo-rc5.sh"
+      - ".github/workflows/lp0002-ci.yml"
+
+  pull_request:
+    paths:
+      - "programs/msig/**"
+      - "test_program_methods/guest/src/bin/msig.rs"
+      - "examples/program_deployment/**"
+      - "lee/state_machine/src/state.rs"
+      - "lee/state_machine/src/privacy_preserving_transaction/circuit.rs"
+      - "scripts/lp0002-demo-rc5.sh"
+      - ".github/workflows/lp0002-ci.yml"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+name: LP-0002 msig
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Unit/integration coverage for the msig state machine + circuit arms and the
+  # msig_core program, plus a compile-check of the LP-0002 flow runners.
+  # All logic runs under RISC0_DEV_MODE=1 (fake receipts). The real
+  # RISC0_DEV_MODE=0 approve STARK and its landing on the live sequencer remain
+  # the separate ZK-soundness evidence (see README-LP0002 / docs/LP-0002-*).
+  # This job is build + logic only and never touches the live testnet.
+  # ----------------------------------------------------------------------------
+  msig-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RISC0_DEV_MODE: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.head_ref }}
+
+      - uses: ./.github/actions/install-system-deps
+
+      - uses: ./.github/actions/install-risc0
+
+      # rc5 auto-provisions logos-blockchain-circuits v0.5.3 during the cargo
+      # build (no manual release download, unlike the v0.1.2 job which curled
+      # circuits v0.4.2 into ~/.logos-blockchain-circuits). LBC_ROOT_DIR is
+      # optional and only needed to point the build at a pre-staged circuits dir.
+      - name: Install active toolchain (1.94.0 from rust-toolchain.toml)
+        run: rustup install
+
+      - name: msig core unit tests
+        run: cargo test -p msig_core
+
+      - name: msig state + circuit tests (RISC0_DEV_MODE=1)
+        run: cargo test -p lee msig_
+
+      - name: Build the LP-0002 client runners
+        run: cargo build --release -p program_deployment --bins
+
+  # ----------------------------------------------------------------------------
+  # Full END-TO-END against a locally-booted STANDALONE sequencer (no external
+  # testnet). scripts/lp0002-demo-rc5.sh:
+  #   * builds the msig guest ELF via `cargo build -p test_program_methods`
+  #     (embedded risc0_build::embed_methods) -- NOT `cargo risczero build`, so
+  #     NO Docker is required for the demo's guest build,
+  #   * builds the standalone sequencer (`--features standalone`) + the wallet CLI + flow runners,
+  #   * boots the sequencer on a fresh scratch dir (block_create_timeout=1s),
+  #   * drives + asserts the whole 2-of-3 lifecycle:
+  #       deploy -> enroll(x3) -> create_proposal -> shielded-fund voters
+  #       -> approve(member 0) -> approve(member 1) -> init_treasury -> fund
+  #       -> execute(threshold 2) -> run_assert_state GREEN
+  #       (approval_count==2, treasury drained, recipient funded).
+  # Runs under RISC0_DEV_MODE=1 (fake receipts) so the flow finishes without the
+  # ~minutes/approve real STARK; the script self-sets RISC0_DEV_MODE=1 too.
+  #
+  # NOTE: the rc5 demo script roots itself at R="${LP0002_ROOT:-/root/lez-rc5}"
+  # and writes the sequencer log to $R/.localnet-demo/seq.log. On a stock runner
+  # the checkout lands at github.workspace (not /root, which is mode 0700 and
+  # untraversable by the runner user), so we point LP0002_ROOT at it. With the
+  # var unset (the local invocation) it expands bit-identically to /root/lez-rc5,
+  # so the locally-verified GREEN flow is unchanged. The on-failure handler tails
+  # $LP0002_ROOT/.localnet-demo/seq.log with a /root/lez-rc5 + workspace fallback.
+  # ----------------------------------------------------------------------------
+  msig-e2e-devmode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RISC0_DEV_MODE: "1"
+      LP0002_ROOT: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.head_ref }}
+
+      - uses: ./.github/actions/install-system-deps
+
+      - uses: ./.github/actions/install-risc0
+
+      - name: Install active toolchain (1.94.0 from rust-toolchain.toml)
+        run: rustup install
+
+      - name: End-to-end flow (standalone sequencer, RISC0_DEV_MODE=1)
+        run: RISC0_DEV_MODE=1 ./scripts/lp0002-demo-rc5.sh
+
+      - name: Sequencer log (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== tail of standalone sequencer log ==="
+          tail -120 "${LP0002_ROOT:-/root/lez-rc5}/.localnet-demo/seq.log" 2>/dev/null \
+            || tail -120 /root/lez-rc5/.localnet-demo/seq.log 2>/dev/null \
+            || find . -name seq.log -exec tail -120 {} \; 2>/dev/null \
+            || true
